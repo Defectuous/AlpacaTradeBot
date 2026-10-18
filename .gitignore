@@ -2,7 +2,7 @@
 .env
 *.env
 
-# Virtualenvs (.venv on Windows, venv on the Pi)
+# Virtualenv (named venv/ everywhere; .venv/ kept ignored in case one gets created)
 .venv/
 venv/
 

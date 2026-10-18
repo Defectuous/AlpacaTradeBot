@@ -8,7 +8,7 @@ Tasks (run as the current user, only while that user is logged on):
   AlpacaTradeBot SML2        starts at logon, restarts on failure, no time limit
   AlpacaTradeBot Daily Bars  Mon-Fri 20:15 local time, runs late if the PC was off
 
-Expects the virtualenv at <repo>\.venv (python -m venv .venv).
+Expects the virtualenv at <repo>\venv (python -m venv venv).
 Only ONE machine may run the SML2 screener against the paper account at a time;
 don't start it here while the Pi is running it.
 #>
@@ -16,8 +16,8 @@ param([switch]$Start)
 $ErrorActionPreference = 'Stop'
 
 $Root   = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$Python = Join-Path $Root '.venv\Scripts\python.exe'
-if (-not (Test-Path $Python)) { throw "Python venv not found at $Python - run: python -m venv .venv; .venv\Scripts\pip install -r requirements.txt" }
+$Python = Join-Path $Root 'venv\Scripts\python.exe'
+if (-not (Test-Path $Python)) { throw "Python venv not found at $Python - run: python -m venv venv; venv\Scripts\pip install -r requirements.txt" }
 
 $User      = "$env:USERDOMAIN\$env:USERNAME"
 $Principal = New-ScheduledTaskPrincipal -UserId $User -LogonType Interactive -RunLevel Limited
