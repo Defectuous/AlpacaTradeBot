@@ -4,7 +4,7 @@
 #   ./deploy/linux/install.sh --start    install + enable + start now
 #
 # Units hard-code User=defectuous and /home/defectuous/AlpacaTradeBot with a
-# venv/ virtualenv. Edit them first if your user or path differs.
+# .venv/ virtualenv. Edit them first if your user or path differs.
 #
 # Only ONE machine may run the SML2 screener against the paper account at a
 # time. Stop the old StockTipsBot unit (screener-sml2) before starting this one.

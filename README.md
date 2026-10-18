@@ -23,8 +23,8 @@ reports/               (gitignored) backtest outputs and the 1-min bar caches th
 ## Setup
 
 ```bash
-python -m venv venv             # the systemd units and Windows scripts expect venv/
-venv/bin/pip install -r requirements.txt      # Windows: venv\Scripts\pip
+python -m venv .venv           # the systemd units and Windows scripts expect .venv/
+.venv/bin/pip install -r requirements.txt     # Windows: .venv\Scripts\pip
 cp .env.example .env            # fill in SML2_ALPACA_API_KEY / SECRET and DISCORD_WEBHOOK_URL
 python run_sml2_screener.py
 ```
@@ -44,7 +44,7 @@ The bot writes `stockbot.db` (positions, wallet, cooldowns) and the daily logs `
 journalctl -u alpacatradebot-sml2 -f
 ```
 
-The units assume user `defectuous`, `/home/defectuous/AlpacaTradeBot` and a `venv/` virtualenv. Edit them if any of those differ.
+The units assume user `defectuous`, `/home/defectuous/AlpacaTradeBot` and a `.venv/` virtualenv. Edit them if any of those differ.
 
 **Windows (Task Scheduler)**
 

@@ -8,6 +8,6 @@ Type=oneshot
 User=defectuous
 WorkingDirectory=/home/defectuous/AlpacaTradeBot
 # The bot writes its sml2.log.* files to the working directory, hence --dir .
-ExecStart=/home/defectuous/AlpacaTradeBot/venv/bin/python tools/store_daily_bars.py --dir . --db market_data.db
+ExecStart=/home/defectuous/AlpacaTradeBot/.venv/bin/python tools/store_daily_bars.py --dir . --db market_data.db
 StandardOutput=journal
 StandardError=journal

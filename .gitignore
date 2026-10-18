@@ -2,7 +2,7 @@
 .env
 *.env
 
-# Virtualenv (named venv/ everywhere; .venv/ kept ignored in case one gets created)
+# Virtualenv (named .venv/ everywhere; venv/ kept ignored in case one gets created)
 .venv/
 venv/
 
