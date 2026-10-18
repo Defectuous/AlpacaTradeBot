@@ -1,0 +1,1406 @@
+"""
+SML2 screener — real-time WebSocket position monitoring with REST scan loop.
+
+Small-cap most-active + MACD/RSI screener ($0.50–$5.00 default range).
+WebSocket upgrade of run_sml_screener.py — same backend/gates, async fill
+detection, but a different entry strategy on purpose: SML runs HOD-breakout,
+SML2 runs RSI/MACD/VWAP, so the two remain an A/B test of strategies (not
+just tuning knobs on one shared signal) as of 2026-08-20.
+
+WebSocket improvements over run_sml_screener.py:
+
+  TradingStream (WebSocket, instant)
+    - Order fills fire via threading.Event — no 5-second poll loop
+    - Trailing stop fills detected in real time — no per-position REST check each cycle
+
+  StockDataStream (WebSocket, tick-by-tick)
+    - Subscribes to live trade prices for every held symbol
+    - monitor_positions reads from an in-memory price cache — zero REST calls per position
+    - Positions are unsubscribed automatically on close to stay lean
+
+  Position monitor now runs every MONITOR_INTERVAL_SECONDS (default 10s) instead of
+  SCAN_INTERVAL_SECONDS, costing nothing extra because it uses cached prices.
+
+Config (env vars or .env):
+  SCREENER_ID             wallet/provider identifier               default: SML2
+  STARTING_BALANCE        initial wallet balance (first run only)  default: 500
+  MAX_POSITIONS           max concurrent open positions            default: 2
+  RESERVE_PCT             % of day-start balance held in reserve   default: 25
+  MIN_BUY_PCT_OF_SLOT     smallest buy allowed when cash is short, default: 50
+                          as % of one slot (deployable / MAX_POSITIONS).
+                          SML2_MIN_BUY_PCT_OF_SLOT overrides.
+  TRAILING_STOP_PERCENT   trailing-stop distance %                 default: 10
+  BUY_COOLDOWN_SECONDS    min seconds between buys/stock           default: 86400
+  SCAN_INTERVAL_SECONDS   seconds between full scans               default: 60
+  MONITOR_INTERVAL_SECONDS secs between position checks            default: 10
+  SML2_PRICE_STALENESS_SECONDS (or PRICE_STALENESS_SECONDS)
+                           max age of a cached WS price before
+                           a REST snapshot refresh is forced      default: 45
+  ALPACA_PAPER            true / false                             default: true
+  DISCORD_WEBHOOK_URL     webhook for buy/error alerts             optional
+  PROFIT_LOCK_PCT         gain % to tighten trailing stop          default: 50
+  TIGHT_STOP_PCT          tighter stop % after profit lock         default: 5
+  RSI_EXIT_LEVEL          RSI level to exit on (declining)         default: 75
+  MAX_HOLD_MINUTES        force-sell after this many min           default: 120
+  START_TIME_ET           don't scan before this time ET           default: "" (off)
+  STOP_BUY_TIME_ET        stop new buys after this time ET         default: "" (off)
+                          override with SML2_STOP_BUY_TIME_ET (use "off" to disable) — added 2026-08-17
+  DUMP_TIME_ET            force-sell all at clock time ET          default: "" (off)
+  MIN_MINUTES_TO_DUMP     no new buys within this many minutes of   default: 0 (off)
+                          DUMP_TIME_ET — added 2026-08-14, see
+                          run_sml_screener.py for rationale
+  HARD_STOP_PCT           hard stop loss % from entry              default: 0 (off)
+                          also submitted as a resting broker-side
+                          stop order at entry, not just polled
+  MIN_GAIN_AT_30M         exit if gain% below this by 30min held   default: -2.0
+  MIN_GAIN_AT_60M         exit if gain% below this by 60min held   default: 0.0
+  VWAP_RECLAIM_DWELL_MIN  exit if price closes below both VWAP and default: 9 (0 = off)
+                          entry price for this many consecutive
+                          1-min bars (tuned via
+                          tools/vwap_reclaim_shadow.py, see todo.md)
+  VWAP_RECLAIM_WARMUP_MIN ignore VWAP-reclaim breaks in first N     default: 3
+                          minutes post-entry
+  MAX_ENTRY_MOVE_PCT      skip buys already up > this %            default: 0 (off)
+                          override with SML2_MAX_ENTRY_MOVE_PCT
+  MAX_ATR                 skip buys with ATR above this            default: 0 (off)
+  MAX_RVOL                skip buys with RVOL above this           default: 0 (off)
+                          SML2_MAX_RVOL overrides the shared value.
+  MIN_RVOL                skip buys with RVOL below this           default: 2.0
+  MIN_CHANGE_PCT          skip buys flat/red on the day below this default: 2.0
+  RSI_ENTRY_MIN           skip buys with RSI below this            default: 60
+  RSI_ENTRY_MAX           skip buys with RSI above this            default: 70
+  MACD_MIN_BARS_ABOVE_SIGNAL  skip buys where MACD crossed above    default: 3
+                          signal fewer than this many 15-min bars
+                          ago — filters out the freshest crossovers.
+                          Live data through 2026-07-29 backs this:
+                          SML fresh-crossover trades averaged -$1.75
+                          (27% win rate, n=48) vs +$1.32 (46% win
+                          rate, n=13) for confirmed ones, so SML2
+                          now requires confirmation instead of
+                          freshness. Override with
+                          SML2_MACD_MIN_BARS_ABOVE_SIGNAL.
+
+  The 5 settings below (all SML2-only, added 2026-09-15 from the
+  day-agnostic backtest of the post-50%-win-rate review — see
+  tools/backtest_symbols.py --profile and reports/backtest_symbols_*.csv):
+  SML2_DONT_CHASE_PCT     skip buys already up > this %             default: 0 (off)
+                          tighter than MAX_ENTRY_MOVE_PCT — backtested
+                          net NEGATIVE in isolation (clips real
+                          winners like CDTG/PSIG along with true
+                          blowups like SST/AMTX); kept bundled here
+                          because it was explicitly requested — the
+                          exits_only profile (this OFF) backtested
+                          better alone (~$157 vs ~$148 per 57/46
+                          trades @ $250 sizing).
+  SML2_ATR_TRAIL_ACTIVATE_PCT  gain% at which a trailing stop         default: 0 (off)
+                          engages (sized ATR_TRAIL_MULT x ATR%),
+                          replacing reliance on PROFIT_LOCK_PCT
+  SML2_ATR_TRAIL_MULT     trail distance = this x (ATR / entry_price) default: 1.5
+  SML2_RSI_EXIT_MIN_GAIN_PCT  RSI-overbought exit only fires above    default: 0 (off)
+                          this gain% — stops it sniping trades
+                          that are barely green
+  SML2_MIN_GAIN_AT_30M / SML2_MIN_GAIN_AT_60M / SML2_MAX_HOLD_MINUTES /
+  SML2_DUMP_TIME_ET       SML2-specific overrides for the
+                          shared-named checkpoint/hold/dump configs
+                          above, so tuning SML2's exit timing doesn't
+                          also move SML's
+"""
+import asyncio
+import logging
+import os
+import threading
+import time
+import warnings
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional, Set
+
+import pytz
+from dotenv import load_dotenv
+from alpaca.data import StockHistoricalDataClient
+from alpaca.data.live import StockDataStream
+from alpaca.data.requests import StockBarsRequest, StockSnapshotRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+from alpaca.trading.enums import OrderSide, OrderType, QueryOrderStatus
+from alpaca.trading.requests import GetOrdersRequest
+
+from bot.database import (
+    close_position,
+    get_open_position_count,
+    get_open_positions,
+    get_wallet,
+    init_db,
+    init_wallet,
+    is_ticker_on_cooldown,
+    mark_stop_tightened,
+    record_ticker_alert,
+    reset_day_wallet,
+    save_position,
+    update_hard_stop_order,
+    update_trailing_stop_order,
+    update_wallet_cash,
+)
+from bot.discord_notify import send_alert, send_close, send_error
+from bot.logging_utils import configure_logging
+from bot.market_data import _rsi_series, _rvol_time_adjusted, estimate_entry_indicators, vwap_reclaim_exit_price
+from bot.most_active import get_most_active_penny_stocks
+from bot.resilient_stream import ResilientTradingStream as TradingStream
+from bot.screener import _analyze
+from bot.trader import Trader
+
+warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
+configure_logging("sml2.log")
+logger = logging.getLogger(__name__)
+
+load_dotenv()
+
+# No SML_ALPACA_API_KEY fallback: that key now belongs to the crypto bot's account.
+ALPACA_KEY       = os.getenv("SML2_ALPACA_API_KEY")    or os.environ["ALPACA_API_KEY"]
+ALPACA_SECRET    = os.getenv("SML2_ALPACA_API_SECRET") or os.environ["ALPACA_API_SECRET"]
+ALPACA_PAPER     = os.getenv("ALPACA_PAPER", "true").lower() == "true"
+SCREENER_ID      = os.getenv("SCREENER_ID",            "SML2")
+STARTING_BALANCE = float(os.getenv("STARTING_BALANCE", "500"))
+MAX_POSITIONS    = int(os.getenv("MAX_POSITIONS",       "2"))
+RESERVE_PCT      = float(os.getenv("RESERVE_PCT",       "25"))
+# A risk-sized first position can take more than one slot (tight ATR stop ->
+# bigger position), leaving less than a full slot for the second. Buy whatever
+# is left as long as it's at least this % of a slot, instead of refusing to
+# scan at all until the first position closes.
+MIN_BUY_PCT_OF_SLOT = float(os.getenv("SML2_MIN_BUY_PCT_OF_SLOT") or os.getenv("MIN_BUY_PCT_OF_SLOT", "50"))
+TRAIL_PCT        = float(os.getenv("TRAILING_STOP_PERCENT",   "10"))
+COOLDOWN_SECS    = int(os.getenv("BUY_COOLDOWN_SECONDS",      "86400"))
+SCAN_INTERVAL    = int(os.getenv("SCAN_INTERVAL_SECONDS",     "60"))
+MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL_SECONDS",  "10"))
+PRICE_STALENESS_SECONDS = float(
+    os.getenv("SML2_PRICE_STALENESS_SECONDS")
+    or os.getenv("PRICE_STALENESS_SECONDS", "45")
+)
+DISCORD_WEBHOOK  = os.getenv("DISCORD_WEBHOOK_URL",           "")
+PROFIT_LOCK_PCT  = float(os.getenv("PROFIT_LOCK_PCT",         "50"))
+TIGHT_STOP_PCT   = float(os.getenv("TIGHT_STOP_PCT",          "5"))
+RSI_EXIT_LEVEL   = float(os.getenv("RSI_EXIT_LEVEL",          "75"))
+MAX_HOLD_MINUTES = int(os.getenv("SML2_MAX_HOLD_MINUTES") or os.getenv("MAX_HOLD_MINUTES", "120"))
+START_TIME_ET    = os.getenv("START_TIME_ET",                 "")
+_stop_buy_override = os.getenv("SML2_STOP_BUY_TIME_ET")
+if _stop_buy_override is None:
+    STOP_BUY_TIME_ET = os.getenv("STOP_BUY_TIME_ET", "")
+elif _stop_buy_override.lower() == "off":
+    STOP_BUY_TIME_ET = ""
+else:
+    STOP_BUY_TIME_ET = _stop_buy_override
+DUMP_TIME_ET     = os.getenv("SML2_DUMP_TIME_ET") or os.getenv("DUMP_TIME_ET", "")
+MIN_MINUTES_TO_DUMP = int(os.getenv("SML2_MIN_MINUTES_TO_DUMP") or os.getenv("MIN_MINUTES_TO_DUMP", "0"))
+HARD_STOP_PCT    = float(os.getenv("HARD_STOP_PCT",           "0"))
+ATR_STOP_MULT    = float(os.getenv("ATR_STOP_MULT",           "2.0"))   # stop distance = ATR_STOP_MULT x ATR, when ATR is available
+ATR_MIN_STOP_PCT = float(os.getenv("ATR_MIN_STOP_PCT",        "2.0"))   # floor — never let a low-ATR read produce a near-zero stop
+ATR_MAX_STOP_PCT = float(os.getenv("ATR_MAX_STOP_PCT",        "10.0"))  # ceiling — never let a high-ATR read blow the stop out past this
+MAX_ENTRY_MOVE_PCT = float(os.getenv("SML2_MAX_ENTRY_MOVE_PCT") or os.getenv("MAX_ENTRY_MOVE_PCT", "0"))
+# "Don't-chase" ceiling — tighter than MAX_ENTRY_MOVE_PCT, SML2-only. Added
+# 2026-09-15 from the day-agnostic backtest of the 5 post-50%-win-rate
+# changes (see tools/backtest_symbols.py --profile). Bundled with the ATR
+# trail/checkpoint/RSI-exit changes below to match the "improved" profile
+# tested in reports/backtest_symbols_rsi_macd_improved.csv — note that the
+# exits_only profile (this ceiling OFF) actually backtested better in
+# isolation (~$157 vs ~$148 per 57/46 trades @ $250 sizing, since it clips
+# real winners like CDTG/PSIG along with the SST/AMTX-style blowups); kept
+# here because it was explicitly requested as the bundled config.
+DONT_CHASE_PCT = float(os.getenv("SML2_DONT_CHASE_PCT", "0"))  # 0 = off
+MAX_ATR          = float(os.getenv("MAX_ATR",                 "0"))
+MAX_RVOL         = float(os.getenv("SML2_MAX_RVOL") or os.getenv("MAX_RVOL", "0"))
+MIN_RVOL         = float(os.getenv("MIN_RVOL",                "2.0"))
+MIN_CHANGE_PCT   = float(os.getenv("MIN_CHANGE_PCT",           "2.0"))
+RSI_ENTRY_MIN    = float(os.getenv("RSI_ENTRY_MIN",            "60"))
+RSI_ENTRY_MAX    = float(os.getenv("RSI_ENTRY_MAX",            "70"))
+MACD_MIN_BARS_ABOVE_SIGNAL = int(
+    os.getenv("SML2_MACD_MIN_BARS_ABOVE_SIGNAL")
+    or os.getenv("MACD_MIN_BARS_ABOVE_SIGNAL", "3")
+)
+MIN_GAIN_AT_30M  = float(os.getenv("SML2_MIN_GAIN_AT_30M") or os.getenv("MIN_GAIN_AT_30M", "-2.0"))
+MIN_GAIN_AT_60M  = float(os.getenv("SML2_MIN_GAIN_AT_60M") or os.getenv("MIN_GAIN_AT_60M", "0.0"))
+VWAP_RECLAIM_DWELL_MIN  = int(os.getenv("VWAP_RECLAIM_DWELL_MIN",  "9"))  # 0 = off
+VWAP_RECLAIM_WARMUP_MIN = int(os.getenv("VWAP_RECLAIM_WARMUP_MIN", "3"))
+EXCLUDE_SYMBOLS  = {s.strip().upper() for s in os.getenv("EXCLUDE_SYMBOLS", "").split(",") if s.strip()}
+
+# ATR-trail + gain-gated RSI exit — SML2-only, added 2026-09-15 alongside
+# DONT_CHASE_PCT above (see that comment for the backtest context). When
+# ATR_TRAIL_ACTIVATE_PCT > 0, a trade gets NO resting trailing stop until
+# it's up this much, at which point the trail engages at
+# ATR_TRAIL_MULT x (ATR / entry_price) — replacing reliance on
+# PROFIT_LOCK_PCT/TIGHT_STOP_PCT for early-engaging protection. Set to 0 to
+# keep the old behavior (hard stop only until PROFIT_LOCK_PCT).
+ATR_TRAIL_ACTIVATE_PCT = float(os.getenv("SML2_ATR_TRAIL_ACTIVATE_PCT", "0"))  # 0 = off
+ATR_TRAIL_MULT         = float(os.getenv("SML2_ATR_TRAIL_MULT", "1.5"))
+RSI_EXIT_MIN_GAIN_PCT  = float(os.getenv("SML2_RSI_EXIT_MIN_GAIN_PCT", "0"))  # 0 = off
+
+PROVIDER = f"{SCREENER_ID}_SCREENER"
+
+_1MIN  = TimeFrame(1,  TimeFrameUnit.Minute)
+_5MIN  = TimeFrame(5,  TimeFrameUnit.Minute)
+_15MIN = TimeFrame(15, TimeFrameUnit.Minute)
+
+# ── Shared streaming state ────────────────────────────────────────────────────
+
+# Real-time price cache: updated by StockDataStream on every trade tick.
+# _price_updated_at tracks when each entry was last refreshed — thin
+# microcaps can go minutes without a print, so a cached price is only
+# trustworthy if it's recent (see monitor_positions).
+_prices: Dict[str, float] = {}
+_price_updated_at: Dict[str, float] = {}
+_prices_lock = threading.Lock()
+
+# Fill notification: main thread registers an Event; TradingStream sets it on fill
+_fill_events: Dict[str, threading.Event] = {}
+_fill_results: Dict[str, Any] = {}
+_fill_lock = threading.Lock()
+
+# Which symbols the StockDataStream is currently subscribed to
+_subscribed: Set[str] = set()
+_sub_lock = threading.Lock()
+
+# Stop order id (trailing OR hard stop-loss) → position info; used by
+# TradingStream callback to close positions without a DB lookup on every
+# fill event. Both of a position's resting orders point at the same dict
+# (via "trailing_id"/"hard_id") so whichever fills first can cancel the other.
+_ts_to_pos: Dict[str, dict] = {}
+_ts_lock = threading.Lock()
+
+_data_stream: Optional[StockDataStream] = None
+_trading_stream: Optional[TradingStream] = None
+_trader: Optional[Trader] = None
+
+
+def _register_stops(
+    pos_id: int, sym: str, buy_price: float, shares: int,
+    trailing_id: Optional[str], hard_id: Optional[str],
+) -> None:
+    """Register a position's resting stop order(s) for TradingStream lookup."""
+    info = {
+        "id": pos_id, "symbol": sym, "buy_price": buy_price, "shares": shares,
+        "trailing_id": trailing_id, "hard_id": hard_id,
+    }
+    with _ts_lock:
+        if trailing_id:
+            _ts_to_pos[trailing_id] = info
+        if hard_id:
+            _ts_to_pos[hard_id] = info
+
+
+def _cancel_and_unregister_stops(trailing_id: Optional[str], hard_id: Optional[str]) -> None:
+    """Cancel both resting stop orders (if present) and drop them from the registry."""
+    for oid in (trailing_id, hard_id):
+        if not oid:
+            continue
+        if _trader:
+            _trader.cancel_order(oid)
+        with _ts_lock:
+            _ts_to_pos.pop(oid, None)
+
+
+# ── Stream callbacks ──────────────────────────────────────────────────────────
+
+async def _on_trade(data) -> None:
+    """StockDataStream trade callback — caches the latest price for each symbol."""
+    with _prices_lock:
+        _prices[data.symbol] = float(data.price)
+        _price_updated_at[data.symbol] = time.monotonic()
+
+
+async def _on_trade_update(data) -> None:
+    """
+    TradingStream callback — fires instantly on every order state change.
+
+    For fills: wakes any thread waiting in _wait_for_fill(), and if the
+    filled order is a sell (trailing stop or manual sell), kicks off async
+    position close on a worker thread so we don't block the event loop.
+    """
+    order = data.order
+    oid   = str(order.id)
+    event = data.event
+
+    if event in ("fill", "partial_fill") and order.status.value == "filled":
+        with _fill_lock:
+            _fill_results[oid] = order
+            ev = _fill_events.get(oid)
+            if ev:
+                ev.set()
+
+        if order.side.value == "sell":
+            fill_price = float(order.filled_avg_price or 0)
+            threading.Thread(
+                target=_close_position_from_stop,
+                args=(oid, fill_price),
+                daemon=True,
+            ).start()
+
+    elif event in ("cancelled", "expired", "rejected"):
+        with _fill_lock:
+            ev = _fill_events.get(oid)
+            if ev:
+                ev.set()
+
+
+def _close_position_from_stop(order_id: str, fill_price: float) -> None:
+    """
+    Called in a worker thread when TradingStream reports a sell fill on
+    either the trailing stop or the hard stop-loss. Looks up the position
+    via in-memory registry (no DB query needed) and cancels the sibling
+    order so it doesn't sit resting against a position that's already gone.
+    """
+    with _ts_lock:
+        pos = _ts_to_pos.pop(order_id, None)
+        if pos is None:
+            return  # not a stop order we're tracking (e.g. manual sell from monitor)
+        sibling_id = pos["hard_id"] if order_id == pos.get("trailing_id") else pos["trailing_id"]
+        if sibling_id:
+            _ts_to_pos.pop(sibling_id, None)
+    if sibling_id and _trader:
+        _trader.cancel_order(sibling_id)
+
+    reason = "Hard stop filled" if order_id == pos.get("hard_id") else "Trailing stop filled"
+    pnl = (fill_price - pos["buy_price"]) * pos["shares"]
+    close_position(pos["id"], fill_price, datetime.now(timezone.utc), pnl)
+    update_wallet_cash(SCREENER_ID, fill_price * pos["shares"])
+    _unsubscribe_prices([pos["symbol"]])
+
+    logger.info(
+        "  WS STOP  %s closed @ $%.4f  PnL=$%+.2f  (%s)",
+        pos["symbol"], fill_price, pnl, reason,
+    )
+    if DISCORD_WEBHOOK:
+        send_close(
+            DISCORD_WEBHOOK, pos["symbol"], pos["buy_price"],
+            fill_price, pos["shares"], pnl,
+            paper=ALPACA_PAPER, reason=reason,
+        )
+
+
+# ── Subscription helpers ──────────────────────────────────────────────────────
+
+def _subscribe_prices(symbols: list) -> None:
+    if not symbols or _data_stream is None:
+        return
+    new_syms = []
+    with _sub_lock:
+        for s in symbols:
+            if s not in _subscribed:
+                _subscribed.add(s)
+                new_syms.append(s)
+    if new_syms:
+        _data_stream.subscribe_trades(_on_trade, *new_syms)
+        logger.info("Price stream subscribed: %s", new_syms)
+
+
+def _unsubscribe_prices(symbols: list) -> None:
+    if not symbols or _data_stream is None:
+        return
+    to_drop = []
+    with _sub_lock:
+        for s in symbols:
+            if s in _subscribed:
+                _subscribed.discard(s)
+                to_drop.append(s)
+    if to_drop:
+        _data_stream.unsubscribe_trades(*to_drop)
+        with _prices_lock:
+            for s in to_drop:
+                _prices.pop(s, None)
+                _price_updated_at.pop(s, None)
+        logger.info("Price stream unsubscribed: %s", to_drop)
+
+
+# ── Fill waiter ───────────────────────────────────────────────────────────────
+
+def _wait_for_fill(order_id: str, timeout: int = 60) -> Optional[Any]:
+    """
+    Block until TradingStream fires a fill event for order_id, or timeout elapses.
+    Falls back to a single REST check if the stream event was missed.
+    Replaces Trader.wait_for_fill()'s 5-second poll loop.
+    """
+    event = threading.Event()
+    with _fill_lock:
+        # Check if fill already arrived before we registered (race condition guard)
+        if order_id in _fill_results:
+            return _fill_results.pop(order_id)
+        _fill_events[order_id] = event
+
+    event.wait(timeout=timeout)
+
+    with _fill_lock:
+        _fill_events.pop(order_id, None)
+        result = _fill_results.pop(order_id, None)
+
+    if result is not None:
+        return result
+
+    # Stream may have missed the event during a brief reconnect — REST fallback
+    if _trader:
+        try:
+            order = _trader.client.get_order_by_id(order_id)
+            if order.status.value == "filled":
+                logger.debug("Order %s confirmed via REST fallback", order_id)
+                return order
+        except Exception as e:
+            logger.error("REST fill check failed for %s: %s", order_id, e)
+
+    logger.warning("Order %s did not fill within %ds", order_id, timeout)
+    return None
+
+
+# ── Stream thread ─────────────────────────────────────────────────────────────
+
+def _start_streams(api_key: str, api_secret: str, paper: bool) -> None:
+    """
+    Initialise both WebSocket streams and run them in a dedicated asyncio
+    event loop on a daemon thread.  Returns after the streams have had a
+    moment to connect so that subscribe calls issued right after work.
+    """
+    global _data_stream, _trading_stream
+
+    def _on_stream_persistent_failure(message: str) -> None:
+        logger.error("Trading stream persistent failure: %s", message)
+        if DISCORD_WEBHOOK:
+            send_error(DISCORD_WEBHOOK, f"[SML2] {message}")
+
+    _data_stream    = StockDataStream(api_key, api_secret)
+    _trading_stream = TradingStream(
+        api_key, api_secret, paper=paper,
+        on_persistent_failure=_on_stream_persistent_failure,
+    )
+    _trading_stream.subscribe_trade_updates(_on_trade_update)
+
+    def _thread():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(asyncio.gather(
+                _trading_stream.run(),
+                _data_stream.run(),
+            ))
+        except Exception as e:
+            logger.error("Stream thread error: %s", e, exc_info=True)
+
+    threading.Thread(target=_thread, name="alpaca-streams", daemon=True).start()
+    time.sleep(2)   # give streams time to authenticate and connect
+
+
+# ── Wallet helpers ────────────────────────────────────────────────────────────
+
+def _compute_buy_amount() -> float:
+    wallet = get_wallet(SCREENER_ID)
+    if not wallet:
+        return 0.0
+    deployable = wallet["day_start_balance"] * (1 - RESERVE_PCT / 100)
+    return deployable / MAX_POSITIONS
+
+
+def _size_by_risk(base_amount: float, price: float, atr: Optional[float]) -> tuple[float, float]:
+    """
+    Convert the flat per-slot budget into a volatility-normalized position:
+    stop distance follows the stock's own ATR instead of a fixed %, and share
+    count is set so dollar risk (stop distance x shares) stays roughly
+    constant at what base_amount x HARD_STOP_PCT would have risked, rather
+    than dollar exposure being constant regardless of how far away the stop
+    has to sit. A tight/low-ATR stock gets a bigger position; a wide/volatile
+    one gets a smaller one. Falls back to the flat HARD_STOP_PCT/base_amount
+    behavior when ATR isn't available.
+
+    Bounds (ATR_MIN_STOP_PCT/ATR_MAX_STOP_PCT) keep the resulting stop —
+    and therefore the resulting position size, since they're inversely
+    related — from swinging too far off base_amount on a noisy ATR read.
+    """
+    if not atr or price <= 0 or HARD_STOP_PCT <= 0:
+        return base_amount, (HARD_STOP_PCT if HARD_STOP_PCT > 0 else TRAIL_PCT)
+
+    raw_stop_pct = ATR_STOP_MULT * atr / price * 100
+    stop_pct     = max(ATR_MIN_STOP_PCT, min(ATR_MAX_STOP_PCT, raw_stop_pct))
+    risk_dollars = base_amount * HARD_STOP_PCT / 100
+    sized_amount = risk_dollars * 100 / stop_pct
+    return sized_amount, stop_pct
+
+
+def _log_wallet() -> None:
+    wallet = get_wallet(SCREENER_ID)
+    if not wallet:
+        return
+    reserve    = wallet["day_start_balance"] * RESERVE_PCT / 100
+    deployable = wallet["day_start_balance"] - reserve
+    available  = wallet["current_balance"] - reserve
+    logger.info(
+        "Wallet [%s]  total=$%.2f  reserve=$%.2f  deployable=$%.2f  available=$%.2f",
+        SCREENER_ID, wallet["current_balance"], reserve, deployable, max(available, 0),
+    )
+
+
+def _maybe_reset_day(trader: Trader, last_day: list) -> None:
+    today_et = datetime.now(pytz.timezone("America/New_York")).strftime("%Y-%m-%d")
+    if last_day[0] == today_et:
+        return
+
+    wallet      = get_wallet(SCREENER_ID)
+    alpaca_cash = trader.get_cash_balance()
+    db_balance  = wallet["current_balance"] if wallet else STARTING_BALANCE
+
+    if alpaca_cash is not None:
+        logger.info("Day reset: DB=$%.2f  Alpaca=$%.2f -> using Alpaca", db_balance, alpaca_cash)
+        reconciled = alpaca_cash
+    else:
+        logger.warning("Day reset: Alpaca cash unavailable, keeping DB $%.2f", db_balance)
+        reconciled = db_balance
+
+    reset_day_wallet(SCREENER_ID, today_et, reconciled)
+    last_day[0] = today_et
+    _log_wallet()
+
+
+# ── Orphan position check ─────────────────────────────────────────────────────
+
+def _check_untracked_positions(trader: Trader, data_client: StockHistoricalDataClient) -> None:
+    """Detect Alpaca positions not in the DB and auto-register them."""
+    try:
+        alpaca_all = trader.client.get_all_positions()  # type: ignore[union-attr]
+        alpaca_map = {p.symbol: p for p in alpaca_all}  # type: ignore[union-attr]
+    except Exception as e:
+        logger.warning("Orphan check: could not fetch Alpaca positions: %s", e)
+        return
+
+    db_syms = {p["symbol"] for p in get_open_positions(PROVIDER)}
+    orphans = set(alpaca_map) - db_syms
+    if not orphans:
+        return
+
+    logger.warning("UNTRACKED Alpaca positions (not in DB): %s", sorted(orphans))
+
+    for sym in sorted(orphans):
+        ap        = alpaca_map[sym]
+        buy_price = float(ap.avg_entry_price)  # type: ignore[union-attr]
+        shares    = int(float(ap.qty))          # type: ignore[union-attr]
+
+        buy_order_id = f"recovered_{sym}_{int(time.time())}"
+        buy_time: datetime = datetime.now(timezone.utc)
+        try:
+            filled = trader.client.get_orders(filter=GetOrdersRequest(  # type: ignore[union-attr]
+                status=QueryOrderStatus.CLOSED, symbols=[sym], limit=20,
+            ))
+            buy_orders = [
+                o for o in filled  # type: ignore[union-attr]
+                if o.side == OrderSide.BUY and o.filled_at is not None
+            ]
+            if buy_orders:
+                buy_orders.sort(key=lambda o: o.filled_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
+                bo           = buy_orders[0]
+                buy_order_id = str(bo.id)
+                buy_time     = bo.filled_at or buy_time
+        except Exception as e:
+            logger.warning("Orphan %s: buy order lookup failed (%s) — using placeholder", sym, e)
+
+        # Orphan recovery has no access to the original scan-time context, so
+        # rsi/atr/change_pct/rvol would otherwise be recorded as NULL, which
+        # makes these trades impossible to audit later. Best-effort reconstruct
+        # them from historical bars around buy_time instead.
+        stats = estimate_entry_indicators(data_client, sym, buy_price, buy_time)
+        if all(v is None for v in stats.values()):
+            logger.warning("Orphan %s: could not reconstruct any entry indicators", sym)
+
+        try:
+            pos_id = save_position(
+                sym, PROVIDER, shares, buy_price, buy_time, buy_order_id,
+                rsi_at_entry=stats["rsi"], atr_at_entry=stats["atr"],
+                change_pct_at_entry=stats["change_pct"], rvol_at_entry=stats["rvol"],
+            )
+        except Exception as e:
+            logger.error("Orphan %s: DB insert failed: %s", sym, e)
+            continue
+
+        ts_id = None
+        hs_id = None
+        try:
+            open_orders = trader.client.get_orders(filter=GetOrdersRequest(  # type: ignore[union-attr]
+                status=QueryOrderStatus.OPEN, symbols=[sym],
+            ))
+            for o in open_orders:  # type: ignore[union-attr]
+                if o.type == OrderType.TRAILING_STOP:
+                    ts_id = str(o.id)
+                elif o.type == OrderType.STOP:
+                    hs_id = str(o.id)
+        except Exception as e:
+            logger.warning("Orphan %s: stop order lookup failed: %s", sym, e)
+
+        if not ts_id and not hs_id:
+            # No protective stop found on the broker (e.g. the fill was missed
+            # during a network blip) — submit one now instead of leaving the
+            # position unprotected until another exit rule happens to catch it.
+            # Only one stop type can rest on the shares at once (see entry
+            # logic), so prefer the hard stop when enabled, else trailing.
+            if HARD_STOP_PCT > 0:
+                hard_stop_price = buy_price * (1 - HARD_STOP_PCT / 100)
+                new_hs = trader.submit_stop_loss(sym, shares, hard_stop_price)
+                if new_hs:
+                    hs_id = str(new_hs.id)
+                    logger.info("Orphan %s: no resting stop found — submitted hard stop  id=%s", sym, hs_id)
+                else:
+                    logger.warning("Orphan %s: hard stop submit failed — trying trailing stop", sym)
+            if not hs_id:
+                new_stop = trader.submit_trailing_stop(sym, shares, TRAIL_PCT)
+                if new_stop:
+                    ts_id = str(new_stop.id)
+                    logger.info("Orphan %s: no resting stop found — submitted trailing stop  id=%s", sym, ts_id)
+                else:
+                    logger.warning("Orphan %s: registered in DB (pos_id=%d) but no stop order found and submit failed — set one manually", sym, pos_id)
+
+        if ts_id:
+            update_trailing_stop_order(pos_id, ts_id)
+        if hs_id:
+            update_hard_stop_order(pos_id, hs_id)
+        if ts_id or hs_id:
+            _register_stops(pos_id, sym, buy_price, shares, ts_id, hs_id)
+            logger.info("Orphan %s: registered  pos_id=%d  ts=%s  hs=%s", sym, pos_id, ts_id, hs_id)
+
+        _subscribe_prices([sym])
+
+
+# ── Position monitoring ───────────────────────────────────────────────────────
+
+def monitor_positions(trader: Trader, data_client: StockHistoricalDataClient) -> None:
+    """
+    Check every open position for exit conditions.
+
+    Current price comes from the WebSocket price cache (_prices) — no REST
+    call per symbol.  Bars for the RSI exit are fetched once per cycle in a
+    single batched request.  Trailing stop fills are handled by TradingStream
+    and do NOT require a check here.
+    """
+    positions = [dict(r) for r in get_open_positions(PROVIDER)]
+    if not positions:
+        return
+
+    now     = datetime.now(pytz.UTC)
+    now_et  = now.astimezone(pytz.timezone("America/New_York"))
+    symbols = list({p["symbol"] for p in positions})
+
+    # Ensure we're subscribed to price ticks for all held symbols
+    _subscribe_prices(symbols)
+
+    # Single batched bar fetch for RSI exit (all symbols at once)
+    try:
+        bars5 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=_5MIN,
+            start=now - timedelta(minutes=120),
+            end=now,
+        )).data
+    except Exception as e:
+        logger.warning("Monitor bars failed: %s", e)
+        bars5 = {}
+
+    # Market-open-anchored 1-min bars for the VWAP-reclaim exit — needs the
+    # full-session running VWAP, not a rolling lookback.
+    bars1 = {}
+    if VWAP_RECLAIM_DWELL_MIN > 0:
+        market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0).astimezone(pytz.UTC)
+        try:
+            bars1 = data_client.get_stock_bars(StockBarsRequest(
+                symbol_or_symbols=symbols,
+                timeframe=_1MIN,
+                start=market_open,
+                end=now,
+            )).data
+        except Exception as e:
+            logger.warning("VWAP-reclaim bar fetch failed: %s", e)
+            bars1 = {}
+
+    for pos in positions:
+        sym                = pos["symbol"]
+        pos_id             = pos["id"]
+        buy_price          = pos["buy_price"]
+        shares             = pos["shares"]
+        stop_order_id      = pos.get("trailing_stop_order_id")
+        hard_stop_order_id = pos.get("hard_stop_order_id")
+        stop_tightened     = pos.get("stop_tightened", 0)
+
+        # Price from WebSocket cache — updated on every trade tick. Thin
+        # microcaps can go quiet for minutes with no print at all, which
+        # would otherwise leave gain_pct silently pinned near the entry
+        # price — so a cache entry older than PRICE_STALENESS_SECONDS is
+        # treated the same as missing.
+        with _prices_lock:
+            current_price = _prices.get(sym)
+            updated_at    = _price_updated_at.get(sym)
+        stale = updated_at is None or (time.monotonic() - updated_at) > PRICE_STALENESS_SECONDS
+
+        if current_price is None or stale:
+            try:
+                snap = data_client.get_stock_snapshot(
+                    StockSnapshotRequest(symbol_or_symbols=[sym])
+                ).get(sym)
+                if snap and snap.latest_trade:
+                    current_price = float(snap.latest_trade.price)
+                    with _prices_lock:
+                        _prices[sym] = current_price
+                        _price_updated_at[sym] = time.monotonic()
+                    if stale and updated_at is not None:
+                        logger.info(
+                            "  %s — price cache stale (%.0fs old), refreshed via snapshot -> $%.4f",
+                            sym, time.monotonic() - updated_at, current_price,
+                        )
+            except Exception:
+                pass
+
+        if current_price is None:
+            continue
+
+        gain_pct = (current_price - buy_price) / buy_price * 100
+
+        def _sell_and_close(reason: str, timeout: int = 30) -> None:
+            _cancel_and_unregister_stops(stop_order_id, hard_stop_order_id)
+
+            # Verify what the broker actually holds before selling — the DB's
+            # share count can drift from the real position (e.g. a trailing
+            # stop fills partially, or a buy fill is misreported). Without this
+            # check a stuck mismatch retries forever every monitor cycle.
+            actual_qty = trader.get_position_qty(sym)
+            if actual_qty <= 0:
+                # Broker holds 0 but the WS fill callback apparently never
+                # fired for us (missed/delayed event) — before falling back
+                # to the last cached price, check whether either resting stop
+                # order actually shows filled and use its real fill price;
+                # cached price can lag the true fill by a tick or more.
+                close_price = current_price
+                for oid in (stop_order_id, hard_stop_order_id):
+                    if not oid:
+                        continue
+                    try:
+                        order = trader.client.get_order_by_id(oid)
+                        if order.status.value == "filled" and order.filled_avg_price:
+                            close_price = float(order.filled_avg_price)
+                            break
+                    except Exception as e:
+                        logger.debug("Stop order lookup failed for %s (%s): %s", sym, oid, e)
+                logger.warning(
+                    "  %s — DB shows %d shares open but broker holds 0; "
+                    "closing DB record at %s (%s)",
+                    sym, shares,
+                    "confirmed fill price" if close_price != current_price else "last known price",
+                    reason,
+                )
+                pnl = (close_price - buy_price) * shares
+                close_position(pos_id, close_price, datetime.now(timezone.utc), pnl)
+                update_wallet_cash(SCREENER_ID, close_price * shares)
+                _unsubscribe_prices([sym])
+                return
+
+            sell_qty = min(shares, actual_qty)
+            if sell_qty < shares:
+                logger.warning(
+                    "  %s — DB shows %d shares but broker holds %d; selling %d",
+                    sym, shares, actual_qty, sell_qty,
+                )
+            sell = trader.market_sell(sym, sell_qty)
+            if not sell:
+                return
+            filled = _wait_for_fill(str(sell.id), timeout=timeout)
+            if not filled:
+                return
+            fp  = float(filled.filled_avg_price)
+            pnl = (fp - buy_price) * sell_qty
+            close_position(pos_id, fp, datetime.now(timezone.utc), pnl)
+            update_wallet_cash(SCREENER_ID, fp * sell_qty)
+            _unsubscribe_prices([sym])
+            logger.info("  SOLD  %s @ $%.4f  PnL=$%+.2f  (%s)", sym, fp, pnl, reason)
+            if DISCORD_WEBHOOK:
+                send_close(DISCORD_WEBHOOK, sym, buy_price, fp, sell_qty, pnl,
+                           paper=ALPACA_PAPER, reason=reason)
+
+        # ── 1. Hard stop (poll fallback — the resting broker order from entry
+        #      normally catches this instantly via a TradingStream fill event;
+        #      this only fires if that order was never placed or is missing) ──
+        # Use this position's own ATR-derived stop distance (saved at entry)
+        # instead of the flat HARD_STOP_PCT config — see run_sml_screener.py
+        # for the full rationale. Falls back to the flat config value for
+        # positions saved before this column existed.
+        effective_stop_pct = pos.get("stop_pct_at_entry") or HARD_STOP_PCT
+        if HARD_STOP_PCT > 0 and effective_stop_pct > 0 and gain_pct <= -effective_stop_pct:
+            logger.info("  HARD STOP  %s  gain=%.2f%%  (limit=%.1f%%)", sym, gain_pct, effective_stop_pct)
+            _sell_and_close(f"Hard stop -{effective_stop_pct:.1f}%")
+            continue
+
+        # ── 2. VWAP-reclaim exit — cuts a fading thesis before the 30-min
+        #      checkpoint gets a chance to. Fires only while underwater vs.
+        #      entry, so it can't nick a still-green trade dipping below
+        #      VWAP; see bot/market_data.py:vwap_reclaim_exit_price for the
+        #      tuned dwell/warmup rationale. ────────────────────────────────
+        buy_dt = datetime.fromisoformat(pos["buy_time"])
+        if buy_dt.tzinfo is None:
+            buy_dt = buy_dt.replace(tzinfo=timezone.utc)
+        if VWAP_RECLAIM_DWELL_MIN > 0:
+            sym_bars1 = list(bars1.get(sym, []))
+            break_price = vwap_reclaim_exit_price(
+                sym_bars1, buy_dt, buy_price,
+                VWAP_RECLAIM_DWELL_MIN, VWAP_RECLAIM_WARMUP_MIN, now=now,
+            )
+            if break_price is not None:
+                logger.info(
+                    "  VWAP RECLAIM EXIT  %s  %d consecutive 1-min closes below VWAP+entry  gain=%+.1f%%",
+                    sym, VWAP_RECLAIM_DWELL_MIN, gain_pct,
+                )
+                _sell_and_close("VWAP-reclaim exit")
+                continue
+
+        # ── 3. Time exit — graduated checkpoints at 30/60min tighten the bar,
+        #      MAX_HOLD_MINUTES is the unconditional final cutoff. This closes
+        #      the gap where a position drifts down 3-5% for the full hold
+        #      window without ever tripping the trailing or hard stop. ──────
+        held_min = (now - buy_dt).total_seconds() / 60
+        if held_min >= MAX_HOLD_MINUTES:
+            logger.info("  TIME EXIT  %s  held %.0fm  gain=%+.1f%%  (max hold)", sym, held_min, gain_pct)
+            _sell_and_close("Max hold time exit")
+            continue
+        elif held_min >= 60 and gain_pct < MIN_GAIN_AT_60M:
+            logger.info("  TIME EXIT  %s  held %.0fm  gain=%+.1f%% < %.1f%% required by 60m",
+                        sym, held_min, gain_pct, MIN_GAIN_AT_60M)
+            _sell_and_close("60-min checkpoint exit")
+            continue
+        elif held_min >= 30 and gain_pct < MIN_GAIN_AT_30M:
+            logger.info("  TIME EXIT  %s  held %.0fm  gain=%+.1f%% < %.1f%% required by 30m",
+                        sym, held_min, gain_pct, MIN_GAIN_AT_30M)
+            _sell_and_close("30-min checkpoint exit")
+            continue
+
+        # ── 4. Dump time ──────────────────────────────────────────────────────
+        if DUMP_TIME_ET:
+            dump_h, dump_m = map(int, DUMP_TIME_ET.split(":"))
+            if (now_et.hour, now_et.minute) >= (dump_h, dump_m):
+                logger.info("  DUMP EXIT  %s  %s ET  gain=%+.1f%%", sym, DUMP_TIME_ET, gain_pct)
+                _sell_and_close(f"Dump time {DUMP_TIME_ET} ET")
+                continue
+
+        # ── 5. RSI exit ───────────────────────────────────────────────────────
+        sym_bars = list(bars5.get(sym, []))
+        if len(sym_bars) >= 20:
+            closes   = [b.close for b in sym_bars]
+            rsi_vals = [r for r in _rsi_series(closes) if r is not None]
+            if len(rsi_vals) >= 4:
+                rsi         = rsi_vals[-1]
+                rsi_falling = rsi_vals[-1] < rsi_vals[-3]
+                if (rsi > RSI_EXIT_LEVEL and rsi_falling
+                        and gain_pct >= RSI_EXIT_MIN_GAIN_PCT):
+                    logger.info(
+                        "  RSI EXIT  %s  RSI=%.1f (falling)  gain=%+.1f%%",
+                        sym, rsi, gain_pct,
+                    )
+                    _sell_and_close("RSI overbought exit")
+                    continue
+
+        # ── 5.5. ATR trail activation — engages a trailing stop as soon as a
+        #      trade is ATR_TRAIL_ACTIVATE_PCT green, sized to the stock's own
+        #      volatility (ATR_TRAIL_MULT x ATR%) instead of waiting for
+        #      PROFIT_LOCK_PCT. Shares the stop_tightened flag with step 6 so
+        #      whichever fires first blocks the other from re-tightening. ────
+        if (ATR_TRAIL_ACTIVATE_PCT > 0 and not stop_tightened
+                and gain_pct >= ATR_TRAIL_ACTIVATE_PCT):
+            entry_atr = pos.get("atr_at_entry")
+            if entry_atr:
+                atr_trail_pct = max(ATR_TRAIL_MULT * (entry_atr / buy_price * 100), 0.5)
+                active_stop_id = stop_order_id or hard_stop_order_id
+                logger.info(
+                    "  ATR TRAIL  %s  +%.1f%% -> engaging %.1f%% trail (%.1fx ATR)",
+                    sym, gain_pct, atr_trail_pct, ATR_TRAIL_MULT,
+                )
+                cancelled = trader.cancel_order(active_stop_id) if active_stop_id else True
+                if cancelled:
+                    new_stop = trader.submit_trailing_stop(sym, shares, atr_trail_pct)
+                    if new_stop:
+                        new_id = str(new_stop.id)
+                        mark_stop_tightened(pos_id, new_id)
+                        if hard_stop_order_id:
+                            update_hard_stop_order(pos_id, None)
+                        with _ts_lock:
+                            _ts_to_pos.pop(active_stop_id, None)
+                        _register_stops(pos_id, sym, buy_price, shares, new_id, None)
+                        logger.info("  STOP  %s ATR-trailed to %.1f%%  id=%s",
+                                    sym, atr_trail_pct, new_id)
+                        stop_tightened = True
+                else:
+                    logger.warning("  ATR TRAIL  %s — cancel failed, keeping original stop", sym)
+
+        # ── 6. Profit lock — no-op once ATR trail (or this itself) has already
+        #      tightened the stop once; kept as a fallback for when
+        #      ATR_TRAIL_ACTIVATE_PCT is 0/off. ────────────────────────────────
+        if not stop_tightened and gain_pct >= PROFIT_LOCK_PCT:
+            # Whichever stop type is currently resting (trailing or hard —
+            # they're mutually exclusive, see entry logic) gets cancelled and
+            # replaced with a tight trailing stop to lock in gains.
+            active_stop_id = stop_order_id or hard_stop_order_id
+            logger.info(
+                "  LOCK  %s  +%.1f%% -> tightening stop -> %.0f%% trailing",
+                sym, gain_pct, TIGHT_STOP_PCT,
+            )
+            cancelled = trader.cancel_order(active_stop_id) if active_stop_id else True
+            if cancelled:
+                new_stop = trader.submit_trailing_stop(sym, shares, TIGHT_STOP_PCT)
+                if new_stop:
+                    new_id = str(new_stop.id)
+                    mark_stop_tightened(pos_id, new_id)
+                    if hard_stop_order_id:
+                        update_hard_stop_order(pos_id, None)
+                    with _ts_lock:
+                        _ts_to_pos.pop(active_stop_id, None)
+                    _register_stops(pos_id, sym, buy_price, shares, new_id, None)
+                    logger.info("  STOP  %s tightened to %.0f%%  id=%s",
+                                sym, TIGHT_STOP_PCT, new_id)
+            else:
+                logger.warning("  LOCK  %s — cancel failed, keeping original stop", sym)
+
+
+# ── Scan and trade ────────────────────────────────────────────────────────────
+
+def scan_and_trade(trader: Trader, data_client: StockHistoricalDataClient) -> None:
+    now    = datetime.now(pytz.UTC)
+    now_et = now.astimezone(pytz.timezone("America/New_York"))
+    ts     = now_et.strftime("%H:%M:%S")
+    hm     = (now_et.hour, now_et.minute)
+
+    if START_TIME_ET:
+        sh, sm = map(int, START_TIME_ET.split(":"))
+        if hm < (sh, sm):
+            logger.info("[%s] Before start time %s ET — waiting", ts, START_TIME_ET)
+            return
+
+    if STOP_BUY_TIME_ET:
+        bh, bm = map(int, STOP_BUY_TIME_ET.split(":"))
+        if hm >= (bh, bm):
+            logger.info("[%s] Past buy cutoff %s ET — no new buys", ts, STOP_BUY_TIME_ET)
+            return
+
+    if DUMP_TIME_ET and MIN_MINUTES_TO_DUMP > 0:
+        dump_h, dump_m = map(int, DUMP_TIME_ET.split(":"))
+        dump_dt = now_et.replace(hour=dump_h, minute=dump_m, second=0, microsecond=0)
+        mins_to_dump = (dump_dt - now_et).total_seconds() / 60
+        if 0 <= mins_to_dump < MIN_MINUTES_TO_DUMP:
+            logger.info("[%s] %.0f min to dump time %s ET, need %d — no new buys",
+                        ts, mins_to_dump, DUMP_TIME_ET, MIN_MINUTES_TO_DUMP)
+            return
+
+    open_count = get_open_position_count(PROVIDER)
+    if open_count >= MAX_POSITIONS:
+        logger.info("[%s] Position cap (%d/%d) — no new buys", ts, open_count, MAX_POSITIONS)
+        return
+
+    wallet = get_wallet(SCREENER_ID)
+    if not wallet:
+        return
+
+    buy_amount = _compute_buy_amount()
+    min_buy    = buy_amount * MIN_BUY_PCT_OF_SLOT / 100
+    reserve    = wallet["day_start_balance"] * RESERVE_PCT / 100
+    available  = wallet["current_balance"] - reserve
+
+    # Gate on the minimum usable buy, not a full slot: the per-candidate sizing
+    # below already caps each buy to what's available.
+    if available < min_buy:
+        logger.info("[%s] Insufficient cash: $%.2f available, $%.2f minimum (%.0f%% of $%.2f slot)",
+                    ts, available, min_buy, MIN_BUY_PCT_OF_SLOT, buy_amount)
+        return
+
+    # ── 1. Most active penny stocks ───────────────────────────────────────────
+    actives = get_most_active_penny_stocks(ALPACA_KEY, ALPACA_SECRET)
+    if not actives:
+        logger.info("[%s] No most-active data returned", ts)
+        return
+
+    symbols    = [s.symbol for s in actives]
+    price_map  = {s.symbol: (s.price, None) for s in actives}
+    volume_map = {s.symbol: s.volume for s in actives}
+
+    # ── 2. Snapshots ──────────────────────────────────────────────────────────
+    try:
+        snaps = data_client.get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=symbols))
+        for sym, snap in snaps.items():
+            if snap and snap.daily_bar and snap.previous_daily_bar:
+                price = snap.daily_bar.close
+                prev  = snap.previous_daily_bar.close
+                chg   = round((price - prev) / prev * 100, 2) if prev else 0.0
+                price_map[sym] = (price, chg)
+    except Exception as e:
+        logger.warning("Snapshot fetch failed: %s", e)
+
+    # ── 3. Bars ───────────────────────────────────────────────────────────────
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+
+    # Rolling window for RSI/ATR — reaches the 20-bar minimum immediately after
+    # open (pulls in pre-market bars) instead of waiting ~100 min for enough
+    # regular-session bars to accumulate.
+    try:
+        bars5 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=_5MIN,
+            start=now - timedelta(minutes=120),
+            end=now,
+        )).data
+    except Exception as e:
+        logger.warning("5-min bar fetch failed: %s", e)
+        bars5 = {}
+
+    # Market-open-anchored window used only for VWAP, so VWAP reflects the
+    # full session rather than a short rolling lookback.
+    try:
+        bars5_vwap = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=_5MIN,
+            start=market_open.astimezone(pytz.UTC),
+            end=now,
+        )).data
+    except Exception as e:
+        logger.warning("VWAP bar fetch failed: %s", e)
+        bars5_vwap = {}
+
+    # Midnight-anchored, not "now minus 3 days" — see run_sml_screener.py for
+    # the full rationale. A fetch pinned to now's exact wall-clock time only
+    # ever captures the earliest day in the window from that clock-time
+    # onward, so on Monday (or the day after any holiday) Friday's
+    # early-session bars never get fetched at all, avg_prior comes back 0,
+    # and RVOL silently returns None all day.
+    rvol_lookback_start = (now_et - timedelta(days=7)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    ).astimezone(pytz.UTC)
+    try:
+        bars15 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbols,
+            timeframe=_15MIN,
+            start=rvol_lookback_start,
+            end=now,
+        )).data
+    except Exception as e:
+        logger.warning("15-min bar fetch failed: %s", e)
+        bars15 = {}
+
+    # ── 4. Screen ─────────────────────────────────────────────────────────────
+    passing = []
+    for sym in symbols:
+        price, chg = price_map[sym]
+        result = _analyze(
+            sym,
+            list(bars5.get(sym,  [])),
+            list(bars15.get(sym, [])),
+            price,
+            chg or 0.0,
+            vwap_bars=list(bars5_vwap.get(sym, [])),
+        )
+        if result and result.passes:
+            passing.append(result)
+
+    logger.info(
+        "[%s] Scanned %d stocks -> %d passing MACD+RSI  pos=%d/%d  buy=$%.2f",
+        ts, len(symbols), len(passing), open_count, MAX_POSITIONS, buy_amount,
+    )
+
+    if not passing:
+        return
+
+    # ── 5. Buy ────────────────────────────────────────────────────────────────
+    for stock in passing:
+        if get_open_position_count(PROVIDER) >= MAX_POSITIONS:
+            break
+
+        sym = stock.symbol
+
+        if sym in EXCLUDE_SYMBOLS:
+            logger.info("  SKIP  %s — on exclude list", sym)
+            continue
+
+        if is_ticker_on_cooldown(sym, COOLDOWN_SECS, PROVIDER):
+            logger.info("  SKIP  %s — cooldown", sym)
+            continue
+
+        if MAX_ENTRY_MOVE_PCT > 0 and stock.change_pct > MAX_ENTRY_MOVE_PCT:
+            logger.info("  SKIP  %s — already up %.1f%% (limit %.0f%%)",
+                        sym, stock.change_pct, MAX_ENTRY_MOVE_PCT)
+            continue
+
+        if DONT_CHASE_PCT > 0 and stock.change_pct > DONT_CHASE_PCT:
+            logger.info("  SKIP  %s — don't-chase: up %.1f%% (limit %.0f%%)",
+                        sym, stock.change_pct, DONT_CHASE_PCT)
+            continue
+
+        if MAX_ATR > 0 and stock.atr and stock.atr > MAX_ATR:
+            logger.info("  SKIP  %s — ATR %.4f > %.4f", sym, stock.atr, MAX_ATR)
+            continue
+
+        if MIN_CHANGE_PCT > 0 and (stock.change_pct is None or stock.change_pct < MIN_CHANGE_PCT):
+            logger.info("  SKIP  %s — change %.2f%% < %.1f%% min", sym, stock.change_pct or 0.0, MIN_CHANGE_PCT)
+            continue
+
+        if not (RSI_ENTRY_MIN <= stock.rsi <= RSI_ENTRY_MAX):
+            logger.info("  SKIP  %s — RSI %.1f outside entry band %.0f-%.0f",
+                        sym, stock.rsi, RSI_ENTRY_MIN, RSI_ENTRY_MAX)
+            continue
+
+        if MACD_MIN_BARS_ABOVE_SIGNAL > 0 and stock.macd_bars_above_signal < MACD_MIN_BARS_ABOVE_SIGNAL:
+            logger.info("  SKIP  %s — MACD crossover too fresh (%d bars < %d min)",
+                        sym, stock.macd_bars_above_signal, MACD_MIN_BARS_ABOVE_SIGNAL)
+            continue
+
+        rvol_ta = _rvol_time_adjusted(list(bars15.get(sym, [])), now_et, symbol=sym)
+        if MIN_RVOL > 0 and (rvol_ta is None or rvol_ta < MIN_RVOL):
+            if rvol_ta is None:
+                logger.info("  SKIP  %s — RVOL unavailable (no bar data) < %.1fx min", sym, MIN_RVOL)
+            else:
+                logger.info("  SKIP  %s — RVOL %.1fx < %.1fx min", sym, rvol_ta, MIN_RVOL)
+            continue
+        if MAX_RVOL > 0 and rvol_ta and rvol_ta > MAX_RVOL:
+            logger.info("  SKIP  %s — RVOL %.1fx > %.0fx max", sym, rvol_ta, MAX_RVOL)
+            continue
+
+        # Sized last, once we know this candidate actually cleared every
+        # other gate — dollar risk stays ~constant across trades, share
+        # count flexes with the stock's own ATR instead of a flat budget.
+        sized_amount, stop_pct = _size_by_risk(buy_amount, stock.price, stock.atr)
+        wallet    = get_wallet(SCREENER_ID)
+        available = wallet["current_balance"] - wallet["day_start_balance"] * RESERVE_PCT / 100
+        # Cap to what's actually available rather than skipping outright — the
+        # risk-sized amount can exceed the flat base budget for a tight-stop
+        # (low-ATR) stock; take the largest position that still respects the
+        # ATR stop distance instead of discarding a qualifying trade because
+        # the risk-optimal size happened to be unaffordable.
+        if sized_amount > available:
+            if available < min_buy:
+                logger.info("  SKIP  %s — depleted available cash (min $%.2f, have $%.2f)",
+                            sym, min_buy, available)
+                continue
+            logger.info("  CAP   %s — sized $%.2f capped to available $%.2f",
+                        sym, sized_amount, available)
+            sized_amount = available
+        if sized_amount < stock.price:
+            logger.info("  SKIP  %s — depleted available cash (need $%.2f, have $%.2f)",
+                        sym, stock.price, available)
+            continue
+
+        logger.info(
+            "  BUY   %s  $%.4f  RSI=%.1f  chg=%+.2f%% (min %.1f%%)  RVOL=%.1fx (min %.1fx)  "
+            "VWAP=%s  budget=$%.2f  stop=-%.1f%% (ATR-sized)",
+            sym, stock.price, stock.rsi, stock.change_pct, MIN_CHANGE_PCT, rvol_ta or 0.0,
+            MIN_RVOL, "ok" if stock.above_vwap else "fail", sized_amount, stop_pct,
+        )
+
+        order, err = trader.buy_stock(sym, sized_amount, stock.price)
+        if err:
+            logger.error("  Buy failed for %s: %s", sym, err)
+            if DISCORD_WEBHOOK and "insufficient buying power" not in err:
+                send_error(DISCORD_WEBHOOK, f"Buy failed for **{sym}**: {err}")
+            if "insufficient buying power" in err:
+                break
+            continue
+
+        # Stream-based fill wait — no poll loop
+        filled = _wait_for_fill(str(order.id), timeout=180)
+        if not filled:
+            logger.error("  %s order did not fill within 3 minutes -- cancelling", sym)
+            if _trader:
+                _trader.cancel_order(str(order.id))
+            continue
+
+        fill_price = float(filled.filled_avg_price)
+        fill_qty   = int(float(filled.filled_qty))
+        cost       = fill_price * fill_qty
+        logger.info("  FILLED %s  %d × $%.4f = $%.2f", sym, fill_qty, fill_price, cost)
+
+        update_wallet_cash(SCREENER_ID, -cost)
+        _log_wallet()
+
+        pos_id = save_position(
+            symbol               = sym,
+            provider             = PROVIDER,
+            shares               = fill_qty,
+            buy_price            = fill_price,
+            buy_time             = datetime.now(timezone.utc),
+            buy_order_id         = str(filled.id),
+            rsi_at_entry         = stock.rsi,
+            atr_at_entry         = stock.atr,
+            change_pct_at_entry  = stock.change_pct,
+            macd_crossover_fresh = stock.macd_crossover,
+            rvol_at_entry        = round(rvol_ta, 3) if rvol_ta else None,
+            stop_pct_at_entry    = stop_pct,
+        )
+
+        # Alpaca reserves the full share qty against the first resting sell
+        # order it accepts, so a trailing stop and a hard stop-loss can never
+        # both rest at once on the same shares — the second submit always
+        # fails with "insufficient qty available for order". Prefer the hard
+        # stop (tighter, fixed-price, fires the instant price trades through
+        # it) when enabled, falling back to the trailing stop otherwise or if
+        # the hard-stop submit itself fails.
+        ts_id = None
+        hs_id = None
+        if HARD_STOP_PCT > 0:
+            hard_stop_price = fill_price * (1 - stop_pct / 100)
+            hs_order = trader.submit_stop_loss(sym, fill_qty, hard_stop_price)
+            if hs_order:
+                hs_id = str(hs_order.id)
+                update_hard_stop_order(pos_id, hs_id)
+                logger.info("  STOP  %s  hard=-%.1f%% ($%.4f)  id=%s",
+                            sym, stop_pct, hard_stop_price, hs_id)
+            else:
+                # Fall back to a trailing stop sized at the same stop_pct used
+                # to size the position, not the looser default TRAIL_PCT —
+                # keeps the fallback consistent with the risk that was budgeted.
+                logger.warning("  Hard stop-loss failed for %s — falling back to trailing stop at %.1f%%", sym, stop_pct)
+                ts_order = trader.submit_trailing_stop(sym, fill_qty, stop_pct)
+                if ts_order:
+                    ts_id = str(ts_order.id)
+                    update_trailing_stop_order(pos_id, ts_id)
+                    logger.info("  STOP  %s  trail=%.1f%%  id=%s", sym, stop_pct, ts_id)
+                else:
+                    logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+                    if DISCORD_WEBHOOK:
+                        send_error(DISCORD_WEBHOOK,
+                                   f"⚠️ **{sym}** ({PROVIDER}) bought with NO stop-loss resting — "
+                                   f"both hard stop and trailing stop failed. Set one manually on Alpaca now.")
+        else:
+            ts_order = trader.submit_trailing_stop(sym, fill_qty, TRAIL_PCT)
+            if ts_order:
+                ts_id = str(ts_order.id)
+                update_trailing_stop_order(pos_id, ts_id)
+                logger.info("  STOP  %s  trail=%.0f%%  id=%s", sym, TRAIL_PCT, ts_id)
+            else:
+                logger.warning("  Trailing stop failed for %s — set manually on Alpaca", sym)
+                if DISCORD_WEBHOOK:
+                    send_error(DISCORD_WEBHOOK,
+                               f"⚠️ **{sym}** ({PROVIDER}) bought with NO stop-loss resting — "
+                               f"trailing stop failed. Set one manually on Alpaca now.")
+
+        # Register in memory so TradingStream callback can close without a DB lookup
+        if ts_id or hs_id:
+            _register_stops(pos_id, sym, fill_price, fill_qty, ts_id, hs_id)
+
+        # Start receiving real-time price ticks for this position
+        _subscribe_prices([sym])
+
+        if DISCORD_WEBHOOK:
+            send_alert(
+                webhook_url    = DISCORD_WEBHOOK,
+                symbol         = sym,
+                provider       = PROVIDER,
+                price          = fill_price,
+                rsi            = stock.rsi,
+                volume         = int(volume_map.get(sym, 0)),
+                momentum       = stock.change_pct,
+                shares_bought  = fill_qty,
+                total_cost     = cost,
+                paper          = ALPACA_PAPER,
+            )
+
+        record_ticker_alert(sym, PROVIDER)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    global _trader
+    mode = "PAPER" if ALPACA_PAPER else "LIVE"
+    logger.info("=" * 60)
+    logger.info("SML2 screener starting  [%s]", SCREENER_ID)
+    logger.info(
+        "Mode: %s | MaxPos: %d | Reserve: %.0f%% | MinBuy: %.0f%% of slot | Stop: %.0f%% | "
+        "Lock: +%.0f%%->%.0f%% | RSI exit: %.0f",
+        mode, MAX_POSITIONS, RESERVE_PCT, MIN_BUY_PCT_OF_SLOT, TRAIL_PCT,
+        PROFIT_LOCK_PCT, TIGHT_STOP_PCT, RSI_EXIT_LEVEL,
+    )
+    logger.info(
+        "Scan: %ds | Monitor: %ds | Cooldown: %ds",
+        SCAN_INTERVAL, MONITOR_INTERVAL, COOLDOWN_SECS,
+    )
+    if START_TIME_ET or STOP_BUY_TIME_ET or DUMP_TIME_ET:
+        logger.info(
+            "Window: start=%s  stop_buy=%s  dump=%s ET  min_min_to_dump=%s",
+            START_TIME_ET or "off", STOP_BUY_TIME_ET or "off", DUMP_TIME_ET or "off",
+            MIN_MINUTES_TO_DUMP or "off",
+        )
+    logger.info(
+        "Entry filters: MIN_RVOL=%.1fx  MAX_RVOL=%s  MIN_CHANGE_PCT=%.1f%%  "
+        "MAX_ENTRY_MOVE_PCT=%s  DONT_CHASE_PCT=%s  MAX_ATR=%s  RSI_ENTRY=%.0f-%.0f  "
+        "MACD_MIN_BARS_ABOVE_SIGNAL=%s  EXCLUDE_SYMBOLS=%s",
+        MIN_RVOL, MAX_RVOL if MAX_RVOL > 0 else "off", MIN_CHANGE_PCT,
+        MAX_ENTRY_MOVE_PCT if MAX_ENTRY_MOVE_PCT > 0 else "off",
+        DONT_CHASE_PCT if DONT_CHASE_PCT > 0 else "off",
+        MAX_ATR if MAX_ATR > 0 else "off",
+        RSI_ENTRY_MIN, RSI_ENTRY_MAX,
+        MACD_MIN_BARS_ABOVE_SIGNAL if MACD_MIN_BARS_ABOVE_SIGNAL > 0 else "off",
+        ",".join(sorted(EXCLUDE_SYMBOLS)) if EXCLUDE_SYMBOLS else "off",
+    )
+    logger.info(
+        "Exit rules: HARD_STOP_PCT=%s (resting + polled)  30m>=%.1f%%  60m>=%.1f%%  MAX_HOLD=%dm  "
+        "RSI_EXIT_MIN_GAIN=%s  ATR_TRAIL: %s",
+        HARD_STOP_PCT if HARD_STOP_PCT > 0 else "off",
+        MIN_GAIN_AT_30M, MIN_GAIN_AT_60M, MAX_HOLD_MINUTES,
+        f"{RSI_EXIT_MIN_GAIN_PCT:.0f}%" if RSI_EXIT_MIN_GAIN_PCT > 0 else "off",
+        f"activate>=+{ATR_TRAIL_ACTIVATE_PCT:.1f}% @ {ATR_TRAIL_MULT:.1f}x ATR" if ATR_TRAIL_ACTIVATE_PCT > 0 else "off",
+    )
+    logger.info("=" * 60)
+
+    init_db()
+    _trader     = Trader(ALPACA_KEY, ALPACA_SECRET, paper=ALPACA_PAPER)
+    data_client = StockHistoricalDataClient(ALPACA_KEY, ALPACA_SECRET)
+
+    init_wallet(SCREENER_ID, STARTING_BALANCE)
+
+    # ── Start WebSocket streams ───────────────────────────────────────────────
+    logger.info("Connecting to Alpaca WebSocket streams…")
+    _start_streams(ALPACA_KEY, ALPACA_SECRET, ALPACA_PAPER)
+    logger.info("Streams connected.")
+
+    # ── Restore state from any positions open before this run ────────────────
+    existing = list(get_open_positions(PROVIDER))
+    if existing:
+        syms = list({p["symbol"] for p in existing})
+        _subscribe_prices(syms)
+
+        # Re-register both stop orders in memory for TradingStream callbacks
+        for p in existing:
+            ts_id = p["trailing_stop_order_id"]
+            hs_id = p["hard_stop_order_id"]
+            if ts_id or hs_id:
+                _register_stops(p["id"], p["symbol"], p["buy_price"], p["shares"], ts_id, hs_id)
+
+        # Check for stop fills that happened while we were offline
+        with _ts_lock:
+            snapshot = dict(_ts_to_pos)
+        already_closed: Set[int] = set()
+        for oid, pos_info in snapshot.items():
+            if pos_info["id"] in already_closed:
+                continue
+            try:
+                order = _trader.client.get_order_by_id(oid)
+                if order.status.value == "filled":
+                    logger.info(
+                        "Startup: stop order %s was filled during downtime — closing %s",
+                        oid, pos_info["symbol"],
+                    )
+                    _close_position_from_stop(oid, float(order.filled_avg_price))
+                    already_closed.add(pos_info["id"])
+            except Exception as e:
+                logger.debug("Startup stop check for %s: %s", oid, e)
+
+        logger.info("Restored %d open position(s): %s", len(existing), syms)
+
+    last_day  = [None]
+    last_scan = 0.0
+    _maybe_reset_day(_trader, last_day)
+
+    logger.info("Running — Ctrl+C to stop")
+    try:
+        while True:
+            _maybe_reset_day(_trader, last_day)
+            monitor_positions(_trader, data_client)
+
+            now = time.monotonic()
+            if now - last_scan >= SCAN_INTERVAL:
+                _check_untracked_positions(_trader, data_client)
+                scan_and_trade(_trader, data_client)
+                last_scan = now
+
+            time.sleep(MONITOR_INTERVAL)
+
+    except KeyboardInterrupt:
+        logger.info("Stopped by user.")
+
+
+if __name__ == "__main__":
+    main()

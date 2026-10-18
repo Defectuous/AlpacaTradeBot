@@ -1,0 +1,189 @@
+"""
+Momentum setup analysis (RSI bounce + MACD) used by the SML2 screener and backtests.
+
+Each candidate is evaluated across two timeframes:
+
+  5-minute bars  — RSI bounce: RSI has pulled back to the 50–65 zone and is
+                   now recovering upward (not overbought, still has room)
+  15-minute bars — MACD: line is above signal with an expanding histogram
+                   (confirms momentum building, not fading)
+
+ATR (Average True Range) is computed from 5-min bars and shown as volatility
+context — it is not a pass/fail filter.
+
+Results are sorted by RSI ascending — lowest RSI first means most room left
+before hitting overbought territory.
+"""
+import logging
+from dataclasses import dataclass
+from datetime import time as dt_time
+from typing import Optional
+
+import pytz
+
+from bot.market_data import _atr, _macd_analysis, _rsi_series, _vwap, _vwap_stdev
+
+logger = logging.getLogger(__name__)
+
+_RSI_MIN     = 50.0   # below this = momentum lost
+_RSI_MAX     = 65.0   # above this = too extended; tightened from 75 to catch earlier entries
+
+
+@dataclass
+class ScreenedStock:
+    symbol:              str
+    price:               float
+    change_pct:          float
+    rsi:                 float
+    rsi_trending_up:     bool
+    macd_above_signal:   bool
+    macd_crossover:      bool
+    macd_bars_above_signal: int
+    histogram_expanding: bool
+    atr:                 Optional[float]
+    vwap:                Optional[float]
+    above_vwap:          bool
+    vwap_stdev:          Optional[float]
+    vwap_z:              Optional[float]
+
+    @property
+    def passes(self) -> bool:
+        rsi_ok   = self.rsi_trending_up and _RSI_MIN <= self.rsi <= _RSI_MAX
+        macd_ok  = self.macd_above_signal and self.histogram_expanding
+        return rsi_ok and macd_ok and self.above_vwap
+
+
+def _analyze(
+    symbol:     str,
+    bars_5m:    list,
+    bars_15m:   list,
+    price:      float,
+    change_pct: float,
+    vwap_bars:  Optional[list] = None,
+) -> Optional["ScreenedStock"]:
+    """
+    bars_5m is used for RSI/ATR and should cover enough history to satisfy
+    the 20-bar minimum (a rolling lookback works fine here).
+
+    vwap_bars, if given, is used for VWAP instead of bars_5m — pass a
+    market-open-anchored bar set so VWAP reflects the full session even
+    when bars_5m is a short rolling window for early-session RSI coverage.
+    """
+    if len(bars_5m) < 20:
+        logger.debug("%s: only %d 5-min bars — skipping", symbol, len(bars_5m))
+        return None
+
+    closes_5m  = [b.close for b in bars_5m]
+    rsi_vals   = [r for r in _rsi_series(closes_5m) if r is not None]
+    if len(rsi_vals) < 4:
+        return None
+
+    rsi            = rsi_vals[-1]
+    rsi_trending_up = rsi_vals[-1] > rsi_vals[-3]
+
+    closes_15m = [b.close for b in bars_15m]
+    macd       = _macd_analysis(closes_15m)
+    atr_val    = _atr(bars_5m)
+    vwap_bars_used = vwap_bars if vwap_bars is not None else bars_5m
+    vwap_val   = _vwap(vwap_bars_used)
+    vwap_stdev_val = _vwap_stdev(vwap_bars_used, vwap_val) if vwap_val is not None else None
+    vwap_z_val = (
+        round((price - vwap_val) / vwap_stdev_val, 2)
+        if vwap_val is not None and vwap_stdev_val
+        else None
+    )
+
+    return ScreenedStock(
+        symbol              = symbol,
+        price               = price,
+        change_pct          = change_pct,
+        rsi                 = rsi,
+        rsi_trending_up     = rsi_trending_up,
+        macd_above_signal   = macd["above_signal"]        if macd else False,
+        macd_crossover      = macd["crossover"]           if macd else False,
+        macd_bars_above_signal = macd["bars_above_signal"] if macd else 0,
+        histogram_expanding = macd["histogram_expanding"] if macd else False,
+        atr                 = atr_val,
+        vwap                = vwap_val,
+        above_vwap          = (price > vwap_val) if vwap_val is not None else False,
+        vwap_stdev          = vwap_stdev_val,
+        vwap_z              = vwap_z_val,
+    )
+
+
+@dataclass
+class HodBreakoutSignal:
+    symbol:            str
+    price:             float
+    change_pct:        float
+    hod:               float
+    trigger:           float
+    stop:              float
+    consol_range_pct:  float
+    volume_ratio:      float
+    atr:               Optional[float]
+
+
+def _detect_hod_breakout(
+    symbol:      str,
+    bars_1m:     list,
+    price:       float,
+    change_pct:  float,
+    bars_5m:     Optional[list] = None,
+    consol_bars: int = 5,
+    consol_range_pct_max: float = 2.0,
+) -> Optional[HodBreakoutSignal]:
+    """
+    HOD (high-of-day) breakout: stock pauses just below its running high of
+    day in a tight range, then breaks out above it on above-average volume.
+    See strategy.md section 1 and tools/backtest_strategies.py's
+    try_hod_breakout() — backtested as the strongest of the four momentum
+    setups documented there (47 trades, 51% win rate, +0.36% avg P&L, vs.
+    -1.23% avg for vwap_bounce, the next best).
+
+    bars_1m must be ascending 1-min bars anchored to market open (09:30 ET);
+    bars_1m[-1] is treated as the still-forming current bar (HOD and the
+    consolidation window are measured over the bars strictly before it, so
+    the breakout bar itself never inflates its own reference level). The
+    live `price` snapshot (not bars_1m[-1].high) is used for the trigger
+    comparison so a fresh tick doesn't have to wait for its bar to close.
+
+    Kill switch: no breakout considered past 11:30 ET, matching strategy.md's
+    "kills the setup: past 11:30 AM".
+    """
+    if len(bars_1m) < consol_bars + 1:
+        return None
+    now_et = bars_1m[-1].timestamp.astimezone(pytz.timezone("America/New_York"))
+    if now_et.time() > dt_time(11, 30):
+        return None
+
+    running_hod = max(b.high for b in bars_1m[:-1])
+    consol = bars_1m[-1 - consol_bars: -1]
+    consol_hi = max(b.high for b in consol)
+    consol_lo = min(b.low for b in consol)
+    if consol_hi <= 0:
+        return None
+    actual_range_pct = (consol_hi - consol_lo) / consol_hi * 100
+    if actual_range_pct > consol_range_pct_max or consol_hi < running_hod * 0.98:
+        return None
+
+    avg_consol_vol = sum(b.volume for b in consol) / len(consol)
+    last = bars_1m[-1]
+    trigger = running_hod * 1.0015
+    if avg_consol_vol <= 0 or price < trigger or last.volume < 2 * avg_consol_vol:
+        return None
+
+    stop = min(consol_lo, running_hod * 0.98)
+    atr_val = _atr(bars_5m) if bars_5m else None
+    return HodBreakoutSignal(
+        symbol            = symbol,
+        price             = price,
+        change_pct        = change_pct,
+        hod               = round(running_hod, 4),
+        trigger           = round(trigger, 4),
+        stop              = round(stop, 4),
+        consol_range_pct  = round(actual_range_pct, 2),
+        volume_ratio      = round(last.volume / avg_consol_vol, 2),
+        atr               = atr_val,
+    )
+

@@ -1,0 +1,331 @@
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Optional, Dict, List
+
+import pytz
+from alpaca.data import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+logger = logging.getLogger(__name__)
+
+
+def _ema_series(values: List[float], period: int) -> List[Optional[float]]:
+    result: List[Optional[float]] = [None] * len(values)
+    if len(values) < period:
+        return result
+    k = 2.0 / (period + 1)
+    ema = sum(values[:period]) / period
+    result[period - 1] = ema
+    for i in range(period, len(values)):
+        ema = values[i] * k + ema * (1.0 - k)
+        result[i] = ema
+    return result
+
+
+def _rsi_series(closes: List[float], period: int = 14) -> List[Optional[float]]:
+    result: List[Optional[float]] = [None] * len(closes)
+    if len(closes) < period + 1:
+        return result
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    def _to_rsi(ag: float, al: float) -> float:
+        return 100.0 if al == 0 else round(100 - (100 / (1 + ag / al)), 2)
+
+    result[period] = _to_rsi(avg_gain, avg_loss)
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        result[i + 1] = _to_rsi(avg_gain, avg_loss)
+    return result
+
+
+def _macd_analysis(closes: List[float]) -> Optional[dict]:
+    """MACD crossover analysis on the provided close series."""
+    ema12 = _ema_series(closes, 12)
+    ema26 = _ema_series(closes, 26)
+
+    macd_vals: List[float] = [
+        e12 - e26
+        for e12, e26 in zip(ema12, ema26)
+        if e12 is not None and e26 is not None
+    ]
+    if len(macd_vals) < 9:
+        return None
+
+    sig_series = _ema_series(macd_vals, 9)
+    pairs = [(m, s) for m, s in zip(macd_vals, sig_series) if s is not None]
+    if len(pairs) < 3:
+        return None
+
+    macd, signal   = pairs[-1]
+    pm,   ps       = pairs[-2]
+    histogram      = macd - signal
+    prev_histogram = pm - ps
+
+    # Crossover: above signal now, was below within last 10 bars
+    was_below = any(m < s for m, s in pairs[-10:-1])
+    crossover = (macd > signal) and was_below
+    histogram_expanding = histogram > 0 and histogram > prev_histogram
+
+    # How many consecutive bars (from the most recent backward) MACD has held
+    # above signal — a small count means the crossover just happened (more
+    # prone to false starts/chop); a larger count means the trend is more
+    # established. 0 if MACD isn't currently above signal.
+    bars_above_signal = 0
+    for m, s in reversed(pairs):
+        if m > s:
+            bars_above_signal += 1
+        else:
+            break
+
+    return {
+        "macd":                round(macd,      4),
+        "signal":              round(signal,    4),
+        "histogram":           round(histogram, 4),
+        "crossover":           crossover,
+        "above_signal":        macd > signal,
+        "histogram_expanding": histogram_expanding,
+        "bars_above_signal":   bars_above_signal,
+    }
+
+
+def _atr(bars: list, period: int = 14) -> Optional[float]:
+    """Average True Range over the last *period* bars."""
+    if len(bars) < period + 1:
+        return None
+    trs = [
+        max(bars[i].high - bars[i].low,
+            abs(bars[i].high - bars[i - 1].close),
+            abs(bars[i].low  - bars[i - 1].close))
+        for i in range(1, len(bars))
+    ]
+    return round(sum(trs[-period:]) / period, 4)
+
+
+def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
+    """Wilder's RSI from a list of close prices (oldest first)."""
+    if len(closes) < period + 1:
+        return None
+
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [abs(min(d, 0.0)) for d in deltas]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(deltas)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 2)
+
+
+def _vwap(bars: list) -> Optional[float]:
+    """VWAP: Σ(typical_price × volume) / Σ(volume) over the provided bars."""
+    total_pv = 0.0
+    total_vol = 0.0
+    for b in bars:
+        tp = (b.high + b.low + b.close) / 3.0
+        total_pv += tp * b.volume
+        total_vol += b.volume
+    if total_vol == 0:
+        return None
+    return round(total_pv / total_vol, 4)
+
+
+def _vwap_stdev(bars: list, vwap: float) -> Optional[float]:
+    """
+    Volume-weighted standard deviation of typical price around VWAP, over
+    the same bar set used to compute *vwap*. Used to express how far the
+    current price sits from VWAP in stdev units (see ScreenedStock.vwap_z)
+    rather than a flat percentage — a 3% move means something different on
+    a choppy stock than on a tight one.
+    """
+    total_vol = 0.0
+    weighted_sq_diff = 0.0
+    for b in bars:
+        tp = (b.high + b.low + b.close) / 3.0
+        total_vol += b.volume
+        weighted_sq_diff += b.volume * (tp - vwap) ** 2
+    if total_vol == 0:
+        return None
+    return round((weighted_sq_diff / total_vol) ** 0.5, 4)
+
+
+def vwap_reclaim_exit_price(
+    bars1: List, buy_time: datetime, buy_price: float,
+    dwell: int, warmup_min: int, now: Optional[datetime] = None,
+) -> Optional[float]:
+    """
+    Early-exit check: fires when price closes below BOTH the running VWAP and
+    entry price for `dwell` consecutive 1-min bars, ignoring the first
+    `warmup_min` minutes post-entry (normal post-fill wobble). Returns the
+    triggering close price, or None if the rule hasn't fired.
+
+    `now`, if given, drops a trailing bar whose minute hasn't fully elapsed
+    yet — bars1 is fetched with end=now, so the last bar can be a
+    still-forming partial (close = latest trade tick, not a settled close);
+    without this it could complete the dwell streak a bar early on a
+    sub-minute wiggle that was never actually part of the tuned rule (see
+    tools/vwap_reclaim_shadow.py, which only ever evaluated closed bars).
+
+    bars1 must be ascending 1-min bars anchored to market open (09:30 ET) so
+    the running VWAP matches the session VWAP entries were screened against
+    (see ScreenedStock.above_vwap in bot/screener.py). "Below VWAP" alone
+    isn't a real thesis break here since entries already require price above
+    VWAP -- underwater-vs-entry is layered on because a trade can dip below
+    VWAP while still green and that's not a fade worth cutting.
+
+    Tuned via tools/vwap_reclaim_shadow.py against 103 closed SML/SML2
+    trades: dwell=9 beat dwell=8 (net +51.6% vs +43.9% P&L-delta, fewer hurt
+    trades), dwell<8 reintroduces winner-cutting, and a %-based VWAP buffer
+    never improved results at any dwell -- see todo.md for the full sweep.
+    """
+    if not bars1 or dwell <= 0:
+        return None
+
+    if now is not None and bars1[-1].timestamp + timedelta(minutes=1) > now:
+        bars1 = bars1[:-1]
+        if not bars1:
+            return None
+
+    vwaps: List[Optional[float]] = []
+    total_pv = 0.0
+    total_vol = 0.0
+    for b in bars1:
+        tp = (b.high + b.low + b.close) / 3.0
+        total_pv += tp * b.volume
+        total_vol += b.volume
+        vwaps.append(total_pv / total_vol if total_vol else None)
+
+    warmup_cutoff = buy_time + timedelta(minutes=warmup_min)
+    below_streak = 0
+    for b, vwap in zip(bars1, vwaps):
+        if b.timestamp < buy_time or b.timestamp < warmup_cutoff:
+            continue
+        below_vwap = vwap is not None and b.close < vwap
+        underwater = b.close < buy_price
+        if below_vwap and underwater:
+            below_streak += 1
+            if below_streak >= dwell:
+                return b.close
+        else:
+            below_streak = 0
+    return None
+
+
+def _rvol_time_adjusted(bars15: list, now_et, symbol: str = "") -> Optional[float]:
+    """
+    Time-adjusted RVOL: today's cumulative volume from 9:30am ET to now vs
+    the average of the same window on prior trading days in the 15-min bars.
+
+    Returns None when there isn't enough bar history to compute a real
+    ratio — distinct from a genuine 0.0x. Logs which specific case it hit
+    at DEBUG so a "RVOL unavailable" skip can be told apart from a
+    legitimately dead stock (see todo.md RVOL None-vs-0.0x bug).
+    """
+    et_tz    = pytz.timezone("America/New_York")
+    open_min = 9 * 60 + 30  # 9:30am in minutes since midnight
+
+    today      = now_et.date()
+    cutoff_min = now_et.hour * 60 + now_et.minute
+
+    by_day: dict = defaultdict(float)
+    for b in bars15:
+        bar_et   = b.timestamp.astimezone(et_tz)
+        bar_date = bar_et.date()
+        bar_min  = bar_et.hour * 60 + bar_et.minute
+        if bar_min < open_min or bar_min > cutoff_min:
+            continue
+        by_day[bar_date] += b.volume
+
+    if today not in by_day:
+        logger.debug(
+            "RVOL %s: no 15-min bars for today (%s) in window yet — %d bars fetched, days seen=%s",
+            symbol, today, len(bars15), sorted(by_day.keys()),
+        )
+        return None
+
+    today_vol  = by_day[today]
+    prior_vols = [v for d, v in by_day.items() if d < today]
+    if not prior_vols:
+        logger.debug(
+            "RVOL %s: no prior-day 15-min bars in 3-day lookback — days seen=%s",
+            symbol, sorted(by_day.keys()),
+        )
+        return None
+
+    avg_prior = sum(prior_vols) / len(prior_vols)
+    if avg_prior == 0:
+        logger.debug("RVOL %s: prior-day volume summed to 0 across %d day(s)", symbol, len(prior_vols))
+        return None
+
+    return round(today_vol / avg_prior, 2)
+
+
+def estimate_entry_indicators(
+    data_client: StockHistoricalDataClient,
+    symbol: str,
+    buy_price: float,
+    buy_time: datetime,
+) -> Dict[str, Optional[float]]:
+    """
+    Best-effort reconstruction of entry-time indicators (RSI, ATR, day change %,
+    time-adjusted RVOL) for a position whose original scan-time context is
+    unavailable — e.g. an orphaned position recovered from Alpaca, or a trade
+    reconstructed after the fact from broker order history. Any value the
+    underlying bars can't support comes back None rather than raising.
+    """
+    out: Dict[str, Optional[float]] = {"rsi": None, "atr": None, "change_pct": None, "rvol": None}
+    et_tz  = pytz.timezone("America/New_York")
+    buy_et = buy_time.astimezone(et_tz)
+
+    try:
+        bars5 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(5, TimeFrameUnit.Minute),
+            start=buy_time - timedelta(hours=6),
+            end=buy_time,
+        )).data.get(symbol, [])
+        closes = [b.close for b in bars5]
+        if len(closes) >= 15:
+            out["rsi"] = _rsi(closes)
+        if len(bars5) >= 15:
+            out["atr"] = _atr(bars5)
+    except Exception as e:
+        logger.debug("estimate_entry_indicators: 5-min bars failed for %s: %s", symbol, e)
+
+    try:
+        daily = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame.Day,
+            start=buy_time - timedelta(days=7),
+            end=buy_time,
+        )).data.get(symbol, [])
+        if len(daily) >= 2 and daily[-2].close:
+            out["change_pct"] = round((buy_price - daily[-2].close) / daily[-2].close * 100, 2)
+    except Exception as e:
+        logger.debug("estimate_entry_indicators: daily bars failed for %s: %s", symbol, e)
+
+    try:
+        bars15 = data_client.get_stock_bars(StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(15, TimeFrameUnit.Minute),
+            start=buy_time - timedelta(days=3),
+            end=buy_time,
+        )).data.get(symbol, [])
+        out["rvol"] = _rvol_time_adjusted(bars15, buy_et)
+    except Exception as e:
+        logger.debug("estimate_entry_indicators: 15-min bars failed for %s: %s", symbol, e)
+
+    return out

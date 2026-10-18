@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Virtualenvs (.venv on Windows, venv on the Pi)
+.venv/
+venv/
+
+# Runtime data — the bot writes these to the repo root
+stockbot.db
+stockbot.test.db
+market_data.db
+sml2.log*
+
+# Synced copy of the Pi's logs + DBs (SML and SML2 history)
+pi_data/
+
+# Generated output
+reports/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+
+# Local tooling
+.claude/

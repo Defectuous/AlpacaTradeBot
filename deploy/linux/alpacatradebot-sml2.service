@@ -1,0 +1,17 @@
+[Unit]
+Description=AlpacaTradeBot — SML2 screener ($0.50–$5.00, paper)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=defectuous
+WorkingDirectory=/home/defectuous/AlpacaTradeBot
+ExecStart=/home/defectuous/AlpacaTradeBot/venv/bin/python run_sml2_screener.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
